@@ -56,9 +56,9 @@ y0 = [-65.0, 0.053, 0.6, 0.318]
 t_span = (0, 100)
 t_eval = np.linspace(0, 100, 10000)
 
-# Método de integración numérica -> USANDO BIBLIOTECA EXTERNA, BDF (necesario para stiff problems)
-sol1 = solve_ivp(hh_model, t_span, y0, args=(I_ext_1,), t_eval=t_eval, method='BDF')
-sol2 = solve_ivp(hh_model, t_span, y0, args=(I_ext_2,), t_eval=t_eval, method='BDF', max_step=0.05)
+# Método de integración numérica -> USANDO BIBLIOTECA EXTERNA
+sol1 = solve_ivp(hh_model, t_span, y0, args=(I_ext_1,), t_eval=t_eval, method='RK45')
+sol2 = solve_ivp(hh_model, t_span, y0, args=(I_ext_2,), t_eval=t_eval, method='RK45')
 
 #Voy a generar las gráficas de las soluciones obtenidas
 #Representar en una gr´afica V frente a t y en otra m, h, n frente a t.
