@@ -5,7 +5,8 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from rk45_fijo import solve
+from numba import njit
+from rk45_fijo import make_rk45_solver
 from tabulation import tabulate_hh_functions, tabulate_hh_functions_interp
 
 output_dir = "results"
@@ -29,67 +30,97 @@ g_K = 36.0       # mS/cm^2
 g_L = 0.3        # mS/cm^2
 area = 7.854e-3  # cm^2
 
-# Funciones continuas (escalares con math para referencia exacta)
+
+# Funciones continuas compiladas con Numba
+@njit(fastmath=True)
 def alpha_m(V):
     x = (-V - 40.0) / 10.0
     return 1.0 if abs(x) < 1e-7 else x / math.expm1(x)
 
+
+@njit(fastmath=True)
 def beta_m(V):
     return 4.0 * math.exp((-V - 65.0) / 18.0)
 
+
+@njit(fastmath=True)
 def alpha_h(V):
     return 0.07 * math.exp((-V - 65.0) / 20.0)
 
+
+@njit(fastmath=True)
 def beta_h(V):
     return 1.0 / (math.exp((-V - 35.0) / 10.0) + 1.0)
 
+
+@njit(fastmath=True)
 def alpha_n(V):
     x = (-V - 55.0) / 10.0
     return 0.1 if abs(x) < 1e-7 else 0.1 * x / math.expm1(x)
 
+
+@njit(fastmath=True)
 def beta_n(V):
     return 0.125 * math.exp((-V - 65.0) / 80.0)
 
+
+@njit(fastmath=True)
 def I_ext_1(t):
     return 0.1 if 0.0 <= t <= 50.0 else 0.0
 
-def hh_model(t, state, I_func, hh_functions):
-    V, m, h, n = state
-    J_ext = I_func(t) / area
+
+def make_hh_solver(hh_functions, I_func):
+    """Genera un solver RK45 compilado con inlining completo de las tasas y la corriente."""
     am, bm, ah, bh, an, bn = hh_functions
 
-    dVdt = (J_ext - g_L*(V - V_L) - g_Na*(m**3)*h*(V - V_Na) - g_K*(n**4)*(V - V_K)) / C_m
-    dmdt = am(V)*(1.0 - m) - bm(V)*m
-    dhdt = ah(V)*(1.0 - h) - bh(V)*h
-    dndt = an(V)*(1.0 - n) - bn(V)*n
+    @njit(fastmath=True)
+    def hh_model(t, state):
+        V, m, h, n = state[0], state[1], state[2], state[3]
+        J_ext = I_func(t) / area
 
-    return np.array([dVdt, dmdt, dhdt, dndt], dtype=np.float64)
+        dVdt = (J_ext - g_L * (V - V_L) - g_Na * (m * m * m) * h * (V - V_Na) - g_K * (n * n * n * n) * (V - V_K)) / C_m
+        dmdt = am(V) * (1.0 - m) - bm(V) * m
+        dhdt = ah(V) * (1.0 - h) - bh(V) * h
+        dndt = an(V) * (1.0 - n) - bn(V) * n
+
+        return (dVdt, dmdt, dhdt, dndt)
+
+    return make_rk45_solver(hh_model)
+
 
 def measure_hh_memory_kb(funcs_tuple):
     """Calcula la memoria total (en KB) ocupada por las 6 tablas dentro de los closures."""
     total_bytes = 0
     for fn in funcs_tuple:
-        if fn.__closure__:
-            for cell in fn.__closure__:
+        target = getattr(fn, "py_func", fn)
+        if target.__closure__:
+            for cell in target.__closure__:
                 val = cell.cell_contents
-                if isinstance(val, list):
+                if isinstance(val, np.ndarray):
+                    total_bytes += val.nbytes
+                elif isinstance(val, list):
                     total_bytes += sys.getsizeof(val) + sum(sys.getsizeof(x) for x in val)
-                elif isinstance(val, np.ndarray):
-                    total_bytes += sys.getsizeof(val)
     return total_bytes / 1024.0
 
-def benchmark_step_us(funcs_tuple, runs=5):
-    """Mide el tiempo mínimo por paso en microsegundos sobre varias repeticiones."""
-    best_total = min(
-        (lambda t0=time.perf_counter(): (solve(hh_model, t_span, y0, dT, args=(I_ext_1, funcs_tuple)), time.perf_counter() - t0)[1])()
-        for _ in range(runs)
-    )
+
+def benchmark_step_us(solver_fn, runs=10):
+    """Mide el tiempo mínimo por paso en microsegundos tras calentar el JIT."""
+    solver_fn(t_span, y0, dT)  # Warmup
+    best_total = float("inf")
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        solver_fn(t_span, y0, dT)
+        elapsed = time.perf_counter() - t0
+        if elapsed < best_total:
+            best_total = elapsed
     return (best_total / n_steps) * 1e6
+
 
 # 1. Simulación de referencia (continua)
 cont_functions = (alpha_m, beta_m, alpha_h, beta_h, alpha_n, beta_n)
-sol_cont = solve(hh_model, t_span, y0, dT, args=(I_ext_1, cont_functions))
-step_us_cont = benchmark_step_us(cont_functions)
+solver_cont = make_hh_solver(cont_functions, I_ext_1)
+sol_cont = solver_cont(t_span, y0, dT)
+step_us_cont = benchmark_step_us(solver_cont)
 
 # 2. Barrido de resoluciones para error y memoria
 results = []
@@ -99,18 +130,20 @@ solutions_interp = {}
 for res in resolutions:
     tab_funcs = tabulate_hh_functions(resolution=res)
     mem_kb = measure_hh_memory_kb(tab_funcs)
-    sol_tab = solve(hh_model, t_span, y0, dT, args=(I_ext_1, tab_funcs))
+    solver_tab = make_hh_solver(tab_funcs, I_ext_1)
+    sol_tab = solver_tab(t_span, y0, dT)
     err_tab = np.max(np.abs(sol_cont.y[0] - sol_tab.y[0]))
     solutions_nearest[res] = sol_tab
 
     interp_funcs = tabulate_hh_functions_interp(resolution=res)
-    sol_interp = solve(hh_model, t_span, y0, dT, args=(I_ext_1, interp_funcs))
+    solver_interp = make_hh_solver(interp_funcs, I_ext_1)
+    sol_interp = solver_interp(t_span, y0, dT)
     err_interp = np.max(np.abs(sol_cont.y[0] - sol_interp.y[0]))
     solutions_interp[res] = sol_interp
 
     if res == ref_resolution:
-        step_us_tab = benchmark_step_us(tab_funcs)
-        step_us_interp = benchmark_step_us(interp_funcs)
+        step_us_tab = benchmark_step_us(solver_tab)
+        step_us_interp = benchmark_step_us(solver_interp)
 
     results.append({
         'Resolución': res,
@@ -121,10 +154,10 @@ for res in resolutions:
 
 # 3. Resumen en consola
 df_results = pd.DataFrame(results)
-print("Tiempo por paso RK45:")
-print(f"  - Continua (Real):  {step_us_cont:.2f} µs")
-print(f"  - Tabulada:         {step_us_tab:.2f} µs (speedup: {step_us_cont / step_us_tab:.2f}x)")
-print(f"  - Interpolada:      {step_us_interp:.2f} µs (speedup: {step_us_cont / step_us_interp:.2f}x)\n")
+print("Tiempo por paso RK45 (Numba JIT):")
+print(f"  - Continua (Real):  {step_us_cont:.4f} µs")
+print(f"  - Tabulada:         {step_us_tab:.4f} µs (speedup: {step_us_cont / step_us_tab:.2f}x)")
+print(f"  - Interpolada:      {step_us_interp:.4f} µs (speedup: {step_us_cont / step_us_interp:.2f}x)\n")
 print(df_results.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
 
 # 4. Gráfica 1: Comparación de trayectorias V(t)
@@ -171,10 +204,10 @@ times_us = [step_us_cont, step_us_tab, step_us_interp]
 colors = ['tab:gray', 'tab:blue', 'tab:orange']
 
 bars = ax.bar(methods, times_us, color=colors, width=0.5)
-ax.bar_label(bars, fmt='%.2f µs', padding=4, fontsize=10, fontweight='bold')
+ax.bar_label(bars, fmt='%.3f µs', padding=4, fontsize=10, fontweight='bold')
 
 ax.set_ylabel('Tiempo por paso RK45 (µs)')
-ax.set_title(f'Coste temporal por paso de integración (Tabla {ref_resolution} pts)')
+ax.set_title(f'Coste temporal por paso de integración - Numba (Tabla {ref_resolution} pts)')
 ax.margins(y=0.18)
 ax.grid(axis='y', linestyle='--', alpha=0.5)
 plt.tight_layout()
