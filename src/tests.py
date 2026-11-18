@@ -16,7 +16,7 @@ os.makedirs(output_dir, exist_ok=True)
 resolutions = [500, 1000, 5000, 10000, 20000, 50000, 100000]
 ref_resolution = 10000  # Resolución usada para la comparativa directa de tiempos
 y0 = [-65.0, 0.053, 0.6, 0.318]
-t_span = (0.0, 100.0)
+t_span = (0.0, 150.0)
 dT = 0.01
 n_steps = int(np.round((t_span[1] - t_span[0]) / dT))
 
@@ -66,7 +66,7 @@ def beta_n(V):
 
 @njit(fastmath=True)
 def I_ext_1(t):
-    return 0.1 if 0.0 <= t <= 50.0 else 0.0
+    return 0.1 if 0.0 <= t <= 100.0 else 0.0
 
 
 def make_hh_solver(hh_functions, I_func):
